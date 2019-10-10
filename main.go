@@ -19,20 +19,56 @@ type StatResponse struct {
 	Average uint64 `json:"average"`
 }
 
+type HashOrder struct {
+	id             uint64
+	availableAfter time.Time
+	password       string
+}
+
+type HasherAppConfig struct {
+	workerCount      int
+	queueSize        uint
+	blockOnFullQueue bool
+}
+
 type HasherAppState struct {
 	storage      map[uint64]string
 	runningTime  uint64
 	sync.RWMutex        // only locks `storage`, `runningTime`. The others are atomic.
 	lastId       uint64 // the current value is the number last given out (and the number of received valid requests)
+	tasks        chan HashOrder
 	wg           sync.WaitGroup
 }
 
-func createHasherAppInstance(srv *http.Server) (http.HandlerFunc, http.HandlerFunc, http.HandlerFunc, http.HandlerFunc, func()) {
+func createHasherAppInstance(srv *http.Server, config HasherAppConfig) (http.HandlerFunc, http.HandlerFunc, http.HandlerFunc, http.HandlerFunc, func()) {
 	var state HasherAppState
 	state.storage = make(map[uint64]string)
+	state.tasks = make(chan HashOrder, config.queueSize)
 	FIVE_SECONDS, _ := time.ParseDuration("5s")
 
+	worker := func() {
+		for order := range state.tasks {
+			time.Sleep(time.Until(order.availableAfter))
+			startTime := time.Now()
+			hasher := sha512.New()
+			hasher.Write([]byte(order.password))
+			// StdEncoding instead of URLEncoding to match reference/requirements
+			hash := base64.StdEncoding.EncodeToString(hasher.Sum(nil))
+			state.Lock()
+			state.storage[order.id] = hash
+			state.runningTime += uint64(time.Since(startTime).Microseconds())
+			state.Unlock()
+		}
+		state.wg.Done()
+	}
+
+	state.wg.Add(config.workerCount)
+	for i := 0; i < config.workerCount; i++ {
+		go worker()
+	}
+
 	hashPostHandler := func(writer http.ResponseWriter, req *http.Request) {
+		startTime := time.Now()
 		if http.MethodPost != req.Method {
 			http.Error(writer, "405 Method Not Allowed", http.StatusMethodNotAllowed)
 			return
@@ -45,24 +81,19 @@ func createHasherAppInstance(srv *http.Server) (http.HandlerFunc, http.HandlerFu
 			}
 			password := passwords[0]
 			id := atomic.AddUint64(&state.lastId, 1)
-			state.wg.Add(1)
-			// At this point, I'm pretty happy with this version.
-			// AVG 6 microseconds and I can't seem to saturate it, no noticeable memory growth.
-			// Performance at scale is actually better than I expected.
-			// Maybe because I've been writing too much Python.
-			time.AfterFunc(FIVE_SECONDS, func() {
-				startTime := time.Now()
-				hasher := sha512.New()
-				hasher.Write([]byte(password))
-				// StdEncoding instead of URLEncoding to match reference/requirements
-				hash := base64.StdEncoding.EncodeToString(hasher.Sum(nil))
-				state.Lock()
-				defer state.Unlock()
-				state.storage[id] = hash
-				state.runningTime += uint64(time.Since(startTime).Microseconds())
-				state.wg.Done()
-			})
-			fmt.Fprintln(writer, id)
+			availableAfter := startTime.Add(FIVE_SECONDS)
+			order := HashOrder{id: id, availableAfter: availableAfter, password: password}
+			if config.blockOnFullQueue {
+				state.tasks <- order
+				fmt.Fprintln(writer, id)
+			} else {
+				select {
+					case state.tasks <- order:
+						fmt.Fprintln(writer, id)
+					default:
+						http.Error(writer, "429 Too Many Requests", http.StatusTooManyRequests)
+				}
+			}
 		} else {
 			http.Error(writer, "400 Bad Request", http.StatusBadRequest)
 		}
@@ -97,7 +128,7 @@ func createHasherAppInstance(srv *http.Server) (http.HandlerFunc, http.HandlerFu
 		if http.MethodGet != req.Method {
 			http.Error(writer, "405 Method Not Allowed", http.StatusMethodNotAllowed)
 		}
-		response := StatResponse{Total: 0, Average: 0}
+		var response StatResponse
 		state.RLock()
 		defer state.RUnlock()
 		processed := len(state.storage)
@@ -117,11 +148,12 @@ func createHasherAppInstance(srv *http.Server) (http.HandlerFunc, http.HandlerFu
 		ONE_SECOND, _ := time.ParseDuration("1s")
 		// There is a very brief period during which
 		// a POST /hash request can be connected but not
-		// yet have been rejected or wg.Add(1)
+		// yet have been rejected or sent a message on the channel
 		// By the time this has been called, `http.Server.Shutdown()` has been called
 		// so we only need to wait long enough for all outstanding open connections
 		// to get through that period, then wait on the workers.
 		time.Sleep(ONE_SECOND)
+		close(state.tasks)
 		state.wg.Wait()
 	}
 
@@ -130,7 +162,12 @@ func createHasherAppInstance(srv *http.Server) (http.HandlerFunc, http.HandlerFu
 
 func main() {
 	httpServer := http.Server{Addr: ":8000"}
-	post, get, stats, shutdown, waiter := createHasherAppInstance(&httpServer)
+	config := HasherAppConfig{
+		workerCount: 20,
+		queueSize: 1000,
+		blockOnFullQueue: false,
+	}
+	post, get, stats, shutdown, waiter := createHasherAppInstance(&httpServer, config)
 	http.HandleFunc("/hash", post)
 	http.HandleFunc("/hash/", get)
 	http.HandleFunc("/stats", stats)

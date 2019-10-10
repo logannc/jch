@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -24,28 +23,44 @@ type StatResponse struct {
 	Average uint64 `json:"average"`
 }
 
-// type HasherAppState struct {
-// 	sync.RWMutex
-// 	storage []Hash
-// }
+type HasherAppState struct {
+	sync.RWMutex
+	storage     []HashOrder
+	runningTime uint64
+	shutdown    bool
+}
 
-func initializeServer() (http.HandlerFunc, http.HandlerFunc, http.HandlerFunc) {
-	storage := make([]HashOrder, 0)
-	var lock sync.RWMutex
-	var runningTime uint64
+func createHasherAppInstance() (http.HandlerFunc, http.HandlerFunc, http.HandlerFunc, http.HandlerFunc) {
+	var state HasherAppState
 	FIVE_SECONDS, err := time.ParseDuration("5s")
 	if err != nil {
 		panic(err)
 	}
 
-	runningTimeWrapper := func(fn http.HandlerFunc) http.HandlerFunc {
+	// I originally had runningTime not be locked by the mutex for slightly increased performance
+	// at the cost of the stats having a small chance of being incorrect if it was called during
+	// a particularly long delay at the location indicated below.
+	// In practice, this might be a trade off we're willing to make,
+	// particularly to decouple logging/timing from implementation details
+	// runningTimeWrapper := func(fn http.HandlerFunc) http.HandlerFunc {
+	// 	return func(writer http.ResponseWriter, req *http.Request) {
+	// 		startTime := time.Now()
+	// 		fn(writer, req)
+	//		>>> DELAY HERE
+	// 		atomic.AddUint64(&state.runningTime, uint64(time.Since(startTime).Microseconds()))
+	// 	}
+	// }
+
+	shutdownWrapper := func(fn http.HandlerFunc) http.HandlerFunc {
 		return func(writer http.ResponseWriter, req *http.Request) {
-			startTime := time.Now()
-			fn(writer, req)
-			// I am not 100% sure of the semantics of Go's type conversion
-			// but these durations will always be small positive integers, so even the most naive type replacement works
-			// (i.e., not twos complement negative numbers)
-			atomic.AddUint64(&runningTime, uint64(time.Since(startTime).Microseconds()))
+			state.RLock()
+			reject := state.shutdown
+			state.RUnlock()
+			if reject {
+				http.Error(writer, "503 Service Unavailable", http.StatusServiceUnavailable)
+			} else {
+				fn(writer, req)
+			}
 		}
 	}
 
@@ -53,6 +68,13 @@ func initializeServer() (http.HandlerFunc, http.HandlerFunc, http.HandlerFunc) {
 		startTime := time.Now()
 		if http.MethodPost != req.Method {
 			http.Error(writer, "405 Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		state.RLock()
+		reject := state.shutdown
+		state.RUnlock()
+		if reject {
+			http.Error(writer, "503 Service Unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		req.ParseForm()
@@ -63,17 +85,18 @@ func initializeServer() (http.HandlerFunc, http.HandlerFunc, http.HandlerFunc) {
 			}
 			hasher := sha512.New()
 			hasher.Write([]byte(password[0]))
-			// TODO : this hash does not match
-			// I produce ZEHhWB65gUlzdVwtDQArEyx-KVLzp_aTaRaPlBzYRIFj6vjFdqEb0Q5B8zVKCZ0vKbZPZklJz0Fd7su2A-gf7Q==
-			//                                  |     |                                                   |
-			// they give ZEHhWB65gUlzdVwtDQArEyx+KVLzp/aTaRaPlBzYRIFj6vjFdqEb0Q5B8zVKCZ0vKbZPZklJz0Fd7su2A+gf7Q==
-			hash := base64.URLEncoding.EncodeToString(hasher.Sum(nil))
+			// StdEncoding instead of URLEncoding to match reference/requirements
+			hash := base64.StdEncoding.EncodeToString(hasher.Sum(nil))
 			order := HashOrder{availableAfter: startTime.Add(FIVE_SECONDS), hash: hash}
-			lock.Lock()
-			storage = append(storage, order)
-			ticket := len(storage)
-			lock.Unlock()
+			state.Lock()
+			state.storage = append(state.storage, order)
+			ticket := len(state.storage)
 			fmt.Fprintf(writer, "%d", ticket)
+			// I am not 100% sure of the semantics of Go's type conversion
+			// but these durations will always be small positive integers, so even the most naive type replacement works
+			// (i.e., not twos complement negative numbers)
+			state.runningTime += uint64(time.Since(startTime).Microseconds())
+			state.Unlock()
 		} else {
 			http.Error(writer, "400 Bad Request", http.StatusBadRequest)
 		}
@@ -91,23 +114,32 @@ func initializeServer() (http.HandlerFunc, http.HandlerFunc, http.HandlerFunc) {
 			http.Error(writer, "400 Bad Request - 1", http.StatusBadRequest)
 			return
 		}
-		ticket, err := strconv.Atoi(components[2])
+		ticket, err := strconv.Atoi(components[len(components)-1])
 		if err != nil {
 			http.Error(writer, "400 Bad Request - 2", http.StatusBadRequest)
 			return
 		}
-		lock.RLock()
-		if len(storage) < ticket {
+		// Deeper go question: Is this RLock necessary?
+		// It is certainly correct WITH the RLock
+		// but it is also possible that it could be correct without the lock
+		// it would depend on how Go handles slice reallocation and when it garbage
+		// collects old slices. I know that Go intelligently reallocates
+		// i.e., doubles capacity then 25% per alloc eventually
+		// but I don't know what it does with the OLD one.
+		// In any case, if you could guarantee that the slice wasn't garbage collected here,
+		// we could omit the RLock because the storage is append only.
+		state.RLock()
+		if len(state.storage) < ticket {
 			http.Error(writer, "400 Bad Request - 3", http.StatusBadRequest)
 		} else {
-			order := storage[ticket-1]
+			order := state.storage[ticket-1]
 			if startTime.After(order.availableAfter) {
 				fmt.Fprintf(writer, "%s", order.hash)
 			} else {
 				http.Error(writer, "400 Bad Request - 4", http.StatusBadRequest)
 			}
 		}
-		lock.RUnlock()
+		state.RUnlock()
 	}
 
 	hashStatsHandler := func(writer http.ResponseWriter, req *http.Request) {
@@ -115,12 +147,15 @@ func initializeServer() (http.HandlerFunc, http.HandlerFunc, http.HandlerFunc) {
 			http.Error(writer, "405 Method Not Allowed", http.StatusMethodNotAllowed)
 		}
 		response := StatResponse{Total: 0, Average: 0}
-		lock.RLock()
-		total := len(storage)
+		// Similar argument about the RLock and about runningTime not being behind a mutex.
+		// we could omit them here for slight performance wins at the cost of
+		// being slightly inaccurate, sometimes.
+		state.RLock()
+		total := len(state.storage)
 		if total > 0 {
-			response = StatResponse{Total: uint(total), Average: runningTime / uint64(total)}
+			response = StatResponse{Total: uint(total), Average: state.runningTime / uint64(total)}
 		}
-		lock.RUnlock()
+		state.RUnlock()
 		msg, err := json.Marshal(response)
 		if err != nil {
 			println(msg, err)
@@ -128,13 +163,20 @@ func initializeServer() (http.HandlerFunc, http.HandlerFunc, http.HandlerFunc) {
 		fmt.Fprintf(writer, "%s", string(msg))
 	}
 
-	return runningTimeWrapper(hashPostHandler), hashGetHandler, hashStatsHandler
+	hashShutdownHandler := func(writer http.ResponseWriter, req *http.Request) {
+		state.Lock()
+		state.shutdown = true
+		state.Unlock()
+	}
+
+	return shutdownWrapper(hashPostHandler), shutdownWrapper(hashGetHandler), shutdownWrapper(hashStatsHandler), hashShutdownHandler
 }
 
 func main() {
-	post, get, stats := initializeServer()
+	post, get, stats, shutdown := createHasherAppInstance()
 	http.HandleFunc("/hash", post)
 	http.HandleFunc("/hash/", get)
 	http.HandleFunc("/stats", stats)
+	http.HandleFunc("/shutdown", shutdown)
 	log.Fatal(http.ListenAndServe(":8000", nil))
 }

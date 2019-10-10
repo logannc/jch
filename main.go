@@ -46,6 +46,10 @@ func createHasherAppInstance(srv *http.Server) (http.HandlerFunc, http.HandlerFu
 			password := passwords[0]
 			id := atomic.AddUint64(&state.lastId, 1)
 			state.wg.Add(1)
+			// At this point, I'm pretty happy with this version.
+			// AVG 6 microseconds and I can't seem to saturate it, no noticeable memory growth.
+			// Performance at scale is actually better than I expected.
+			// Maybe because I've been writing too much Python.
 			time.AfterFunc(FIVE_SECONDS, func() {
 				startTime := time.Now()
 				hasher := sha512.New()
@@ -96,9 +100,9 @@ func createHasherAppInstance(srv *http.Server) (http.HandlerFunc, http.HandlerFu
 		response := StatResponse{Total: 0, Average: 0}
 		state.RLock()
 		defer state.RUnlock()
-		total := len(state.storage)
-		if total > 0 {
-			response = StatResponse{Total: uint(total), Average: state.runningTime / uint64(total)}
+		processed := len(state.storage)
+		if processed > 0 {
+			response = StatResponse{Total: uint(processed), Average: state.runningTime / uint64(processed)}
 		}
 		msg, _ := json.Marshal(response)
 		fmt.Fprintln(writer, string(msg))

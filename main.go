@@ -22,8 +22,8 @@ type StatResponse struct {
 type HasherAppState struct {
 	storage      map[uint64]string
 	runningTime  uint64
-	sync.RWMutex // only locks `storage`, `runningTime`. The others are atomic.
-	lastId       uint64 // the current value is the number last given out (and the number of received requests)
+	sync.RWMutex        // only locks `storage`, `runningTime`. The others are atomic.
+	lastId       uint64 // the current value is the number last given out (and the number of received valid requests)
 	wg           sync.WaitGroup
 }
 
@@ -44,7 +44,7 @@ func createHasherAppInstance(srv *http.Server) (http.HandlerFunc, http.HandlerFu
 				return
 			}
 			password := passwords[0]
-			ticket := atomic.AddUint64(&state.lastId, 1)
+			id := atomic.AddUint64(&state.lastId, 1)
 			state.wg.Add(1)
 			time.AfterFunc(FIVE_SECONDS, func() {
 				startTime := time.Now()
@@ -54,11 +54,11 @@ func createHasherAppInstance(srv *http.Server) (http.HandlerFunc, http.HandlerFu
 				hash := base64.StdEncoding.EncodeToString(hasher.Sum(nil))
 				state.Lock()
 				defer state.Unlock()
-				state.storage[ticket] = hash
+				state.storage[id] = hash
 				state.runningTime += uint64(time.Since(startTime).Microseconds())
 				state.wg.Done()
 			})
-			fmt.Fprintln(writer, ticket)
+			fmt.Fprintln(writer, id)
 		} else {
 			http.Error(writer, "400 Bad Request", http.StatusBadRequest)
 		}
@@ -106,7 +106,7 @@ func createHasherAppInstance(srv *http.Server) (http.HandlerFunc, http.HandlerFu
 
 	hashShutdownHandler := func(writer http.ResponseWriter, req *http.Request) {
 		fmt.Fprintln(writer, "ok")
-		go srv.Shutdown(context.Background())
+		go srv.Shutdown(context.Background()) // in goroutine so response succeeds
 	}
 
 	waiter := func() {

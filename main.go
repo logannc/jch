@@ -14,11 +14,13 @@ import (
 	"time"
 )
 
+// Response Type for /stats
 type StatResponse struct {
 	Total   uint   `json:"total"`
 	Average uint64 `json:"average"`
 }
 
+// Type for the taske queue for processing hash requests
 type HashOrder struct {
 	id             uint64
 	availableAfter time.Time
@@ -26,23 +28,51 @@ type HashOrder struct {
 }
 
 type HasherAppConfig struct {
-	workerCount      int
-	queueSize        uint
-	blockOnFullQueue bool
+	// number of goroutine workers
+	workerCount      int 
+	// size of buffered channel
+	queueSize        uint 
+	// whether to block or discard request when channel is full
+	blockOnFullQueue bool 
 }
 
 type HasherAppState struct {
 	storage      map[uint64]string
 	runningTime  uint64
-	sync.RWMutex        // only locks `storage`, `runningTime`. The others are atomic.
-	lastId       uint64 // the current value is the number last given out (and the number of received valid requests)
+	// only locks `storage`, `runningTime`. The others are atomic.
+	sync.RWMutex        
+	// the current value is the number last given out (and the number of received valid requests)
+	lastId       uint64 
 	tasks        chan HashOrder
 	wg           sync.WaitGroup
 }
 
+
+// Returns 4 `http.HandlerFunc`s which you can mount (mostly) wherever
+// you like and a waiter method to indicate all requests have been processed.
+// (POST, GET, STATS, SHUTDOWN, waiter)
+// POST - POST with form `password:string` to receive an id to later request the hashed password
+// GET - GET /hash/<id:int> returns a previously requested hash of a password if 5 seconds has elapsed
+// STATS - GET this route to get the number of requests made and the average processing time
+// SHUTDOWN - returns 'ok' and prohibits new connections. after all requests are processed, exits the server.
+// waiter - use after `http.ListenAndServe()` to wait requests being processed.
 func createHasherAppInstance(srv *http.Server, config HasherAppConfig) (http.HandlerFunc, http.HandlerFunc, http.HandlerFunc, http.HandlerFunc, func()) {
 	var state HasherAppState
 	state.storage = make(map[uint64]string)
+	// I don't really like this. I believe buffered queues preallocate their
+	// memory. What I'd really like is some bounded ring buffer that does not
+	// preallocate memory (i.e., resizes). Unbounded queues are not good, 
+	// but I shouldn't need an entirely static one.
+	//
+	// Though, even an unbounded channel would likely be fine here for most
+	// applications. Either it'll be small enough most of the time,
+	// or there is a chance of spiking and you have to drop requests
+	// to keep from OOMing. If the latter happens, I, personally, want
+	// to avoid dropping the requests so I'd have it use Redis or something
+	// to persist the queue, which would avoid this whole business. 
+	//
+	// Of course, then you wouldn't have microsecond response times,
+	// but thats the price of scale.
 	state.tasks = make(chan HashOrder, config.queueSize)
 	FIVE_SECONDS, _ := time.ParseDuration("5s")
 
@@ -106,11 +136,17 @@ func createHasherAppInstance(srv *http.Server, config HasherAppConfig) (http.Han
 		}
 		path := req.URL.Path
 		components := strings.Split(path, "/")
-		if (len(components) != 3) || (components[1] != "hash") {
+		// This part is kind of not complete.
+		// I kind of wanted my implementation to be able to be mounted anywhere.
+		// It just returns handlers and you mount them somewhere. But the built in
+		// router is not good enough, it would let weird routes hit this handler.
+		// So we do some checking to make sure that /hash/test/3 doesn't work, etc
+		numComponents := len(components)
+		if (numComponents != 3) || (components[numComponents-2] != "hash") {
 			http.Error(writer, "400 Bad Request", http.StatusBadRequest)
 			return
 		}
-		ticket, err := strconv.Atoi(components[len(components)-1])
+		ticket, err := strconv.Atoi(components[numComponents-1])
 		if err != nil {
 			http.Error(writer, "400 Bad Request", http.StatusBadRequest)
 			return
@@ -133,6 +169,12 @@ func createHasherAppInstance(srv *http.Server, config HasherAppConfig) (http.Han
 		defer state.RUnlock()
 		processed := len(state.storage)
 		if processed > 0 {
+			// I thought about returning a float
+			// we're typically at like 6 microseconds on my machine, so
+			// plus or minus one unit is actually kind of big.
+			// But the reference returns an int.
+			//
+			// Also, Total should maybe be state.lastId?
 			response = StatResponse{Total: uint(processed), Average: state.runningTime / uint64(processed)}
 		}
 		msg, _ := json.Marshal(response)
@@ -141,14 +183,15 @@ func createHasherAppInstance(srv *http.Server, config HasherAppConfig) (http.Han
 
 	hashShutdownHandler := func(writer http.ResponseWriter, req *http.Request) {
 		fmt.Fprintln(writer, "ok")
-		go srv.Shutdown(context.Background()) // in goroutine so response succeeds
+		go srv.Shutdown(context.Background()) // in goroutine so THIS response succeeds
+		// does not cancel other open connections
 	}
 
 	waiter := func() {
 		ONE_SECOND, _ := time.ParseDuration("1s")
 		// There is a very brief period during which
-		// a POST /hash request can be connected but not
-		// yet have been rejected or sent a message on the channel
+		// a POST /hash request has an open TCP connection but
+		// yet has not been rejected or sent a message on the channel.
 		// By the time this has been called, `http.Server.Shutdown()` has been called
 		// so we only need to wait long enough for all outstanding open connections
 		// to get through that period, then wait on the workers.

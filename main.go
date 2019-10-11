@@ -206,8 +206,8 @@ func createHasherAppInstance(srv *http.Server, config HasherAppConfig) (http.Han
 func main() {
 	httpServer := http.Server{Addr: ":8000"}
 	config := HasherAppConfig{
-		workerCount: 20,
-		queueSize: 1000,
+		workerCount: 30,
+		queueSize: 10000,
 		blockOnFullQueue: false,
 	}
 	post, get, stats, shutdown, waiter := createHasherAppInstance(&httpServer, config)

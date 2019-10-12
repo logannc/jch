@@ -20,7 +20,7 @@ type StatResponse struct {
 	Average uint64 `json:"average"`
 }
 
-// Type for the taske queue for processing hash requests
+// Type for the task queue for processing hash requests
 type HashOrder struct {
 	id             uint64
 	availableAfter time.Time
@@ -34,6 +34,7 @@ type HasherAppConfig struct {
 	queueSize uint
 	// whether to block or discard request when channel is full
 	blockOnFullQueue bool
+	// how long to wait before processing a request - time.ParseDuration(delayString)
 	delayString      string
 }
 
@@ -51,11 +52,18 @@ type HasherAppState struct {
 // Returns 4 `http.HandlerFunc`s which you can mount (mostly) wherever
 // you like and a waiter method to indicate all requests have been processed.
 // (POST, GET, STATS, SHUTDOWN, waiter)
-// POST - POST with form `password:string` to receive an id to later request the hashed password
-// GET - GET /hash/<id:int> returns a previously requested hash of a password if 5 seconds has elapsed
+// POST - POST with form `password=string` to receive an id to later request the hashed password
+// GET - GET /hash/<id:int> returns a previously requested hash of a password if `delayString` duration has elapsed
 // STATS - GET this route to get the number of requests made and the average processing time
 // SHUTDOWN - returns 'ok' and prohibits new connections. after all requests are processed, exits the server.
-// waiter - use after `http.ListenAndServe()` to wait requests being processed.
+// waiter - use after `http.ListenAndServe()` to wait for all requests being processed to complete.
+//
+// As an aside, I haven't used Go recently so I'm not sure I like this closure-state approach.
+// It does neatly encapsulate the application state.
+// I'd also like to look into moving the function definitions out of the this
+// instantiation method, creating closures which call methods defined elsewhere
+// but due to my infamiliarity with Go memory semantics and time constraints,
+// this will have to suffice.
 func createHasherAppInstance(srv *http.Server, config HasherAppConfig) (http.HandlerFunc, http.HandlerFunc, http.HandlerFunc, http.HandlerFunc, func()) {
 	var state HasherAppState
 	state.storage = make(map[uint64]string)
@@ -118,10 +126,10 @@ func createHasherAppInstance(srv *http.Server, config HasherAppConfig) (http.Han
 				fmt.Fprint(writer, id)
 			} else {
 				select {
-				case state.tasks <- order:
-					fmt.Fprint(writer, id)
-				default:
-					http.Error(writer, "429 Too Many Requests", http.StatusTooManyRequests)
+					case state.tasks <- order:
+						fmt.Fprint(writer, id)
+					default:
+						http.Error(writer, "429 Too Many Requests", http.StatusTooManyRequests)
 				}
 			}
 		} else {
@@ -173,6 +181,17 @@ func createHasherAppInstance(srv *http.Server, config HasherAppConfig) (http.Han
 			// we're typically at like 6 microseconds on my machine, so
 			// plus or minus one unit is actually kind of big.
 			// But the reference returns an int.
+			//
+			// If we could return a float, then I might do
+			// runningTime += math.Log(elapsed)
+			// average = math.Exp(runningTime/processed)
+			// to get the geometric mean. It handles outliers better
+			// and if we're only looking at ONE statistical descriptor
+			// the geometric mean or the median are going to be better.
+			// If we wanted a more complete story of our processing time
+			// (i.e., what percent of requests were longer than 5 seconds)
+			// we would need more sophisticated techniques.
+			// Alternatively, we might use some kind of moving average, etc.
 			//
 			// Also, Total should maybe be state.lastId?
 			response = StatResponse{Total: uint(processed), Average: state.runningTime / uint64(processed)}
